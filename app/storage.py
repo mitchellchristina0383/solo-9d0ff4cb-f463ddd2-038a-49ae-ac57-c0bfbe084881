@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -16,6 +17,24 @@ from typing import Optional
 
 from .config import settings
 from .elftools_ext import ELFValidationError, FrameSymbol, Symbolizer, inspect_blob
+
+_HEX_BUILD_ID = re.compile(r"^[0-9a-f]+$")
+
+
+class ObservationError(Exception):
+    """复发观察相关错误的基类。"""
+
+
+class ObservationNotFound(ObservationError):
+    """观察号不存在。"""
+
+
+class ObservationStillRunning(ObservationError):
+    """观察尚未停止，结论不可用。"""
+
+
+class ObservationValidationError(ObservationError, ValueError):
+    """开启观察的入参/基准报告不满足条件。"""
 
 
 @dataclass(frozen=True)
@@ -79,6 +98,25 @@ class Store:
                     build_id  TEXT,
                     address   TEXT NOT NULL,
                     UNIQUE(report_id, position)
+                );
+                CREATE TABLE IF NOT EXISTS observations (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                    stopped_at       TEXT,
+                    fixed_build_id   TEXT NOT NULL,
+                    reference_report INTEGER NOT NULL REFERENCES reports(id),
+                    ref_frame0_file  TEXT NOT NULL,
+                    ref_frame0_func  TEXT NOT NULL,
+                    ref_frame1_file  TEXT NOT NULL,
+                    ref_frame1_func  TEXT NOT NULL,
+                    last_report_id   INTEGER NOT NULL,
+                    symbol_version   INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS observation_samples (
+                    observation_id INTEGER NOT NULL REFERENCES observations(id),
+                    report_id      INTEGER NOT NULL REFERENCES reports(id),
+                    position       INTEGER NOT NULL,
+                    PRIMARY KEY (observation_id, report_id)
                 );
                 """
             )
@@ -304,6 +342,303 @@ class Store:
             "SELECT build_id, sha256, version FROM elfs ORDER BY build_id"
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # 复发观察
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _normalize_build_id(raw: str) -> str:
+        if not isinstance(raw, str):
+            raise ObservationValidationError("修复版 Build ID 必须为十六进制字符串")
+        build_id = raw.strip().lower()
+        if not _HEX_BUILD_ID.fullmatch(build_id):
+            raise ObservationValidationError(
+                "修复版 Build ID 非法：只允许十六进制字符（0-9a-f），不带 0x 前缀"
+            )
+        return build_id
+
+    def _get_observation_row(self, observation_id: int) -> Optional[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM observations WHERE id=?", (observation_id,)
+        ).fetchone()
+
+    def create_observation(
+        self, reference_report_id: int, fixed_build_id: str
+    ) -> dict:
+        """开启复发观察。
+
+        - 基准报告必须存在、至少两帧，且前两帧在当前符号版本下都已解析出
+          源码文件名与函数名（四项缺一即 422，先补传 ELF 再开启）；
+        - 冻结基准四项与开启时的报告 ID 水位、符号版本；
+        - 样本在停止时才锁定，开启与停止之间入库的报告才参与选样。
+        """
+        build_id = self._normalize_build_id(fixed_build_id)
+        with self._lock, self._conn:
+            raw = self.get_report_raw(reference_report_id)
+            if raw is None:
+                raise ObservationValidationError(
+                    f"基准报告 {reference_report_id} 不存在"
+                )
+            if len(raw["frames"]) < 2:
+                raise ObservationValidationError(
+                    f"基准报告 {reference_report_id} 至少需要两帧，"
+                    f"实际 {len(raw['frames'])} 帧"
+                )
+            version = self.symbol_version
+            resolved = self.resolve_report(
+                reference_report_id, snapshot_version=version
+            )
+            frozen: list[tuple[str, str]] = []
+            missing: list[str] = []
+            for frame in resolved["frames"][:2]:
+                pos = frame["position"]
+                file_name = frame["source_file"]
+                function = frame["function"]
+                if file_name is None:
+                    missing.append(f"第 {pos + 1} 帧源码文件名")
+                if function is None:
+                    missing.append(f"第 {pos + 1} 帧函数名")
+                frozen.append((file_name or "", function or ""))
+            if missing:
+                raise ObservationValidationError(
+                    "基准报告前两帧尚未解析出"
+                    + "、".join(missing)
+                    + "；请先补传对应 ELF 再开启观察"
+                )
+            last_report_id = int(
+                self._conn.execute(
+                    "SELECT COALESCE(MAX(id), 0) AS m FROM reports"
+                ).fetchone()["m"]
+            )
+            cur = self._conn.execute(
+                "INSERT INTO observations("
+                "fixed_build_id, reference_report, ref_frame0_file, ref_frame0_func,"
+                " ref_frame1_file, ref_frame1_func, last_report_id, symbol_version)"
+                " VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    build_id,
+                    reference_report_id,
+                    frozen[0][0],
+                    frozen[0][1],
+                    frozen[1][0],
+                    frozen[1][1],
+                    last_report_id,
+                    version,
+                ),
+            )
+            observation_id = cur.lastrowid
+        return self._running_view(self._get_observation_row(observation_id))
+
+    @staticmethod
+    def _running_view(obs: sqlite3.Row) -> dict:
+        """运行中观察的视图：不锁定样本、不出具结论，也不抛 409。"""
+        return {
+            "observation_id": obs["id"],
+            "created_at": obs["created_at"],
+            "stopped_at": None,
+            "status": "running",
+            "fixed_build_id": obs["fixed_build_id"],
+            "reference_report_id": obs["reference_report"],
+            "reference": {
+                "frame0_source_file": obs["ref_frame0_file"],
+                "frame0_function": obs["ref_frame0_func"],
+                "frame1_source_file": obs["ref_frame1_file"],
+                "frame1_function": obs["ref_frame1_func"],
+            },
+            "created_symbol_version": obs["symbol_version"],
+            "snapshot_symbol_version": None,
+            "sample_count": 0,
+            "recurrence_evidence_report_ids": [],
+            "excluded_report_ids": [],
+            "pending_report_ids": [],
+            "samples": [],
+        }
+
+    def stop_observation(self, observation_id: int) -> dict:
+        """停止观察并锁定样本范围（幂等：重复停止/重启后沿用同一范围）。
+
+        选样条件：开启与停止之间已入库（报告 ID 落在水位区间内）、首帧
+        Build ID 与修复版相符（大小写不敏感）、至少两帧；按报告原顺序固化。
+        停止后新上报的报告不再入样，符号补传不受影响。
+        """
+        with self._lock:
+            obs = self._get_observation_row(observation_id)
+            if obs is None:
+                raise ObservationNotFound(f"观察 {observation_id} 不存在")
+            if obs["stopped_at"] is not None:
+                return self.get_observation(observation_id)  # 幂等：原范围不变
+
+            max_report_id = int(
+                self._conn.execute(
+                    "SELECT COALESCE(MAX(id), 0) AS m FROM reports"
+                ).fetchone()["m"]
+            )
+            candidates = self._conn.execute(
+                """
+                SELECT r.id AS report_id
+                FROM reports r
+                WHERE r.id > ? AND r.id <= ?
+                  AND (
+                        SELECT COUNT(*) FROM frames f WHERE f.report_id = r.id
+                      ) >= 2
+                  AND LOWER(COALESCE((
+                        SELECT f.build_id FROM frames f
+                        WHERE f.report_id = r.id ORDER BY f.position LIMIT 1
+                      ), '')) = ?
+                ORDER BY r.id
+                """,
+                (obs["last_report_id"], max_report_id, obs["fixed_build_id"]),
+            ).fetchall()
+
+            with self._conn:  # 样本固化与停止标记同一事务
+                self._conn.executemany(
+                    "INSERT INTO observation_samples(observation_id, report_id, position)"
+                    " VALUES(?,?,?)",
+                    [
+                        (observation_id, row["report_id"], pos)
+                        for pos, row in enumerate(candidates)
+                    ],
+                )
+                self._conn.execute(
+                    "UPDATE observations SET stopped_at="
+                    "strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
+                    (observation_id,),
+                )
+        return self.get_observation(observation_id)
+
+    def get_observation(self, observation_id: int) -> dict:
+        """凭观察号查结论。
+
+        停止后每次调用在核查开始时取一次符号版本快照，整次核查只使用
+        version <= 快照版本 的已发布符号；运行中查询抛 ObservationStillRunning。
+        """
+        obs = self._get_observation_row(observation_id)
+        if obs is None:
+            raise ObservationNotFound(f"观察 {observation_id} 不存在")
+
+        reference = {
+            "frame0_source_file": obs["ref_frame0_file"],
+            "frame0_function": obs["ref_frame0_func"],
+            "frame1_source_file": obs["ref_frame1_file"],
+            "frame1_function": obs["ref_frame1_func"],
+        }
+        if obs["stopped_at"] is None:
+            raise ObservationStillRunning(
+                f"观察 {observation_id} 尚未停止：停止后才能锁定样本并出具结论"
+            )
+
+        result = {
+            "observation_id": obs["id"],
+            "created_at": obs["created_at"],
+            "stopped_at": obs["stopped_at"],
+            "status": "running",
+            "fixed_build_id": obs["fixed_build_id"],
+            "reference_report_id": obs["reference_report"],
+            "reference": reference,
+            "created_symbol_version": obs["symbol_version"],
+            "snapshot_symbol_version": None,
+            "sample_count": 0,
+            "recurrence_evidence_report_ids": [],
+            "excluded_report_ids": [],
+            "pending_report_ids": [],
+            "samples": [],
+        }
+
+        # 核查开始时取一次快照，期间新发布的符号本次不可见
+        snapshot = self.symbol_version
+        ref_pairs = [
+            (obs["ref_frame0_file"], obs["ref_frame0_func"]),
+            (obs["ref_frame1_file"], obs["ref_frame1_func"]),
+        ]
+        sample_rows = self._conn.execute(
+            "SELECT report_id, position FROM observation_samples"
+            " WHERE observation_id=? ORDER BY position",
+            (observation_id,),
+        ).fetchall()
+
+        evidence: list[int] = []
+        excluded: list[int] = []
+        pending: list[int] = []
+        samples: list[dict] = []
+        for srow in sample_rows:
+            report_id = srow["report_id"]
+            resolved = self.resolve_report(report_id, snapshot_version=snapshot)
+            frames = resolved["frames"][:2]  # 选样已保证 >=2 帧
+            comparisons = []
+            known_difference = False
+            missing_info = False
+            for idx in range(2):
+                ref_file, ref_func = ref_pairs[idx]
+                actual_file = frames[idx]["source_file"]
+                actual_func = frames[idx]["function"]
+                # 任何一项“已知不同”即排除；未知项（未解析）不参与差异判定
+                if actual_file is not None and actual_file != ref_file:
+                    known_difference = True
+                if actual_func is not None and actual_func != ref_func:
+                    known_difference = True
+                if actual_file is None or actual_func is None:
+                    missing_info = True
+                comparisons.append(
+                    {
+                        "position": idx,
+                        "reference_source_file": ref_file,
+                        "reference_function": ref_func,
+                        "actual_source_file": actual_file,
+                        "actual_function": actual_func,
+                    }
+                )
+            if known_difference:
+                state = "excluded"
+                excluded.append(report_id)
+            elif missing_info:
+                state = "pending"
+                pending.append(report_id)
+            else:  # 四项均已知且全部相同
+                state = "recurrence"
+                evidence.append(report_id)
+            samples.append(
+                {
+                    "report_id": report_id,
+                    "position": srow["position"],
+                    "state": state,
+                    "comparisons": comparisons,
+                }
+            )
+
+        if evidence:
+            status = "recurrence_detected"
+        elif not sample_rows:
+            status = "no_samples"  # 无样本单列，不与“全被排除”混淆
+        elif len(excluded) == len(sample_rows):
+            status = "no_recurrence_all_excluded"
+        else:
+            status = "awaiting_symbols"
+
+        result.update(
+            {
+                "status": status,
+                "snapshot_symbol_version": snapshot,
+                "sample_count": len(sample_rows),
+                "recurrence_evidence_report_ids": evidence,
+                "excluded_report_ids": excluded,
+                "pending_report_ids": pending,
+                "samples": samples,
+            }
+        )
+        return result
+
+    def list_observations(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT id FROM observations ORDER BY id"
+        ).fetchall()
+        items = []
+        for row in rows:
+            try:
+                items.append(self.get_observation(row["id"]))
+            except ObservationStillRunning:
+                # 列表视图里运行中的观察给出运行态，不抛 409
+                items.append(self._running_view(self._get_observation_row(row["id"])))
+        return items
 
     def close(self) -> None:
         self._conn.close()

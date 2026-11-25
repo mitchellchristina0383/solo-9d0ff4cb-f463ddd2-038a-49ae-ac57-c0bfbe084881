@@ -9,7 +9,13 @@ from pydantic import BaseModel, Field
 
 from . import __version__
 from .config import settings
-from .storage import BatchRejected, Store
+from .storage import (
+    BatchRejected,
+    ObservationNotFound,
+    ObservationStillRunning,
+    ObservationValidationError,
+    Store,
+)
 
 _store: Optional[Store] = None
 
@@ -87,6 +93,67 @@ class BatchResult(BaseModel):
     new_build_ids: List[str]
     redundant: int
     symbol_version: int
+
+
+# ---------------------------------------------------------------------------
+# 复发观察模型
+# ---------------------------------------------------------------------------
+class ObservationIn(BaseModel):
+    reference_report_id: int = Field(
+        ..., description="旧报告号：其前两帧在当前符号下已解析出源码文件名与函数名"
+    )
+    fixed_build_id: str = Field(
+        ..., description="修复版 Build ID（十六进制，不带 0x）；样本仅取首帧 Build ID 相符的报告"
+    )
+
+
+class ObservationReference(BaseModel):
+    frame0_source_file: str
+    frame0_function: str
+    frame1_source_file: str
+    frame1_function: str
+
+
+class FrameComparison(BaseModel):
+    position: int
+    reference_source_file: str
+    reference_function: str
+    actual_source_file: Optional[str]
+    actual_function: Optional[str]
+
+
+class SampleOut(BaseModel):
+    report_id: int
+    position: int
+    state: str = Field(
+        ...,
+        description="recurrence=四项全同；excluded=任一已知项不同；pending=无已知差异但仍缺信息",
+    )
+    comparisons: List[FrameComparison]
+
+
+class ObservationOut(BaseModel):
+    observation_id: int
+    created_at: str
+    stopped_at: Optional[str]
+    status: str = Field(
+        ...,
+        description=(
+            "running=观察中；recurrence_detected=发现复发（附证据报告号）；"
+            "awaiting_symbols=无复发证据、仍有缺信息报告；"
+            "no_recurrence_all_excluded=样本全部因已知差异排除；no_samples=无样本"
+        ),
+    )
+    fixed_build_id: str
+    reference_report_id: int
+    reference: ObservationReference
+    created_symbol_version: int
+    snapshot_symbol_version: Optional[int]
+    sample_count: int
+    recurrence_evidence_report_ids: List[int]
+    excluded_report_ids: List[int]
+    pending_report_ids: List[int]
+    samples: List[SampleOut]
 
 
 # ---------------------------------------------------------------------------
@@ -168,3 +235,67 @@ def list_symbols():
     """列出当前已发布的 Build ID。"""
     store = get_store()
     return {"symbol_version": store.symbol_version, "build_ids": store.list_build_ids()}
+
+
+# ---------------------------------------------------------------------------
+# 复发观察
+# ---------------------------------------------------------------------------
+@app.post(
+    "/observations",
+    response_model=ObservationOut,
+    status_code=201,
+    tags=["复发观察"],
+)
+def create_observation(payload: ObservationIn):
+    """开启复发观察。
+
+    校验旧报告前两帧在当前符号下都已解析出源码文件名与函数名，冻结四项基准；
+    样本在停止时才锁定，仅取开启与停止之间入库、首帧 Build ID 与修复版相符、
+    至少两帧的报告。
+    """
+    store = get_store()
+    try:
+        return store.create_observation(
+            payload.reference_report_id, payload.fixed_build_id
+        )
+    except ObservationValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@app.post("/observations/{observation_id}/stop", response_model=ObservationOut, tags=["复发观察"])
+def stop_observation(observation_id: int):
+    """停止观察并锁定样本范围；重复停止或进程重启后沿用同一范围（幂等）。
+
+    停止后照常接收报障与补传，但新报告不再进入该观察的样本；
+    之后仍可为样本中的报告补传符号，再查结论即可获得最新判定。
+    """
+    store = get_store()
+    try:
+        return store.stop_observation(observation_id)
+    except ObservationNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ObservationStillRunning as exc:  # 理论不可达：stop 内部会先停止
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.get("/observations/{observation_id}", response_model=ObservationOut, tags=["复发观察"])
+def get_observation(observation_id: int):
+    """凭观察号查结论。
+
+    每次核查在开始时取一次符号版本快照，只解析该快照下已发布的符号；
+    观察运行中返回 409；无复发证据时列出仍缺信息且未被排除的报告号。
+    """
+    store = get_store()
+    try:
+        return store.get_observation(observation_id)
+    except ObservationNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ObservationStillRunning as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.get("/observations", response_model=List[ObservationOut], tags=["复发观察"])
+def list_observations():
+    """列出全部观察（运行中的也会出现，status=running）。"""
+    store = get_store()
+    return store.list_observations()
